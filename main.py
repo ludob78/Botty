@@ -1,9 +1,10 @@
 from contextlib import asynccontextmanager
+import json
 import logging
 import os
 
-from fastapi import FastAPI, HTTPException, Depends, Query
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, Depends, Query, Request
+from pydantic import BaseModel, Field, ValidationError
 import uvicorn
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -102,10 +103,28 @@ class PositionItem(BaseModel):
 
 # ── Auth dependency ──────────────────────────────────────────────────
 
-def verify_request(signal: TradeSignal):
+async def get_webhook_body(request: Request) -> TradeSignal:
+    """Parse JSON body from request. Accepts application/json or raw JSON string (e.g. text/plain from TradingView)."""
+    body = await request.body()
+    if isinstance(body, bytes):
+        body = body.decode("utf-8")
+    if isinstance(body, str):
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=422, detail=f"Invalid JSON: {e}")
+    else:
+        data = body
+    try:
+        return TradeSignal.model_validate(data)
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=e.errors())
+
+
+def verify_request(signal: TradeSignal = Depends(get_webhook_body)) -> TradeSignal:
     if signal.key != API_SECRET_KEY:
         raise HTTPException(status_code=403, detail="Clé API invalide")
-    return True
+    return signal
 
 
 # ── Routes ───────────────────────────────────────────────────────────
@@ -155,7 +174,7 @@ async def positions(
         403: {"description": "Invalid API key"},
     },
 )
-async def receive_signal(signal: TradeSignal, verified: bool = Depends(verify_request)):
+async def receive_signal(signal: TradeSignal = Depends(verify_request)):
     """
     Main endpoint for incoming trading signals (designed for TradingView webhooks).
 
