@@ -1,48 +1,172 @@
-from fastapi import FastAPI, HTTPException, Header, Depends
-from pydantic import BaseModel
-import uvicorn
-import hmac
-import hashlib
-
-app = FastAPI(title="Trading Bot Gateway 2026")
-
-# --- Sécurité ---
+from contextlib import asynccontextmanager
+import logging
 import os
+
+from fastapi import FastAPI, HTTPException, Depends, Query
+from pydantic import BaseModel, Field
+import uvicorn
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
 API_SECRET_KEY = os.environ.get("API_SECRET_KEY", "VOTRE_CLE_SUPER_SECRETE")
-TRADINGVIEW_IPS = ["52.32.178.7", "54.218.243.192"] # IPs officielles TV
+
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    yield
+
+
+app = FastAPI(
+    title="Botty — Trading Bot Gateway",
+    description=(
+        "API gateway that receives trading signals (e.g. from TradingView webhooks) "
+        "and executes them on a MetaTrader 5 account.\n\n"
+        "**Authentication**: every POST request must include a `key` field matching "
+        "the server-side `API_SECRET_KEY` environment variable."
+    ),
+    version="1.0.0",
+    lifespan=lifespan,
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_tags=[
+        {"name": "General", "description": "Health check and status endpoints"},
+        {"name": "Trading", "description": "Order execution and position management via MetaTrader 5"},
+    ],
+)
+
+
+# ── Request / Response models ────────────────────────────────────────
 
 class TradeSignal(BaseModel):
-    action: str
+    key: str = Field(description="API secret key for authentication")
+    symbol: str = Field(examples=["EURUSD"], description="Trading instrument symbol")
+    action: str = Field(
+        examples=["buy"],
+        description="Order action: buy, sell, buy_limit, sell_limit, buy_stop, sell_stop, or close_all",
+    )
+    quantity: float = Field(examples=[0.1], description="Volume in lots")
+    price: float | None = Field(default=None, examples=[1.08550], description="Limit/stop price (omit for market orders)")
+    sl: float | None = Field(default=None, examples=[1.08000], description="Stop-loss price")
+    tp: float | None = Field(default=None, examples=[1.09000], description="Take-profit price")
+    position: str | None = Field(default=None, description="Position identifier (reserved for future use)")
+    timestamp: str | None = Field(default=None, description="Signal timestamp from the alert source")
+
+    model_config = {"json_schema_extra": {
+        "examples": [{
+            "key": "your_api_secret_key",
+            "symbol": "EURUSD",
+            "action": "buy",
+            "quantity": 0.1,
+            "price": None,
+            "sl": 1.08000,
+            "tp": 1.09000,
+        }]
+    }}
+
+
+class StatusResponse(BaseModel):
+    message: str
+
+
+class HealthResponse(BaseModel):
+    status: str = Field(examples=["healthy"])
+    mt5: str = Field(examples=["connected"])
+    balance: float | None = Field(default=None, examples=[10000.0])
+
+
+class OrderResult(BaseModel):
+    success: bool
+    ticket: int | None = None
+    price: float | None = None
+    volume: float | None = None
+
+
+class WebhookResponse(BaseModel):
+    status: str = Field(examples=["success"])
+    order: OrderResult | None = None
+    closed: list[OrderResult] | None = None
+
+
+class PositionItem(BaseModel):
+    ticket: int
     symbol: str
+    type: int
+    volume: float
+    price_open: float
     sl: float
-    key: str
+    tp: float
+    profit: float
+    comment: str | None = None
+
+
+# ── Auth dependency ──────────────────────────────────────────────────
 
 def verify_request(signal: TradeSignal):
-    # 1. Vérification de la clé secrète
     if signal.key != API_SECRET_KEY:
         raise HTTPException(status_code=403, detail="Clé API invalide")
     return True
 
-@app.get("/")
+
+# ── Routes ───────────────────────────────────────────────────────────
+
+@app.get(
+    "/",
+    tags=["General"],
+    summary="Root",
+    response_model=StatusResponse,
+)
 async def root():
-    return {"message": "Hello World"}
+    """Returns a simple status message confirming the gateway is running."""
+    return {"message": "Trading Bot Gateway — MT5 service disabled"}
 
-@app.get("/health")
+
+@app.get(
+    "/health",
+    tags=["General"],
+    summary="Health check",
+    response_model=HealthResponse,
+)
 async def health():
-    return {"status": "healthy"}
+    """Reports the health of the service. MT5 integration is currently disabled."""
+    return {"status": "healthy", "mt5": "disabled", "balance": None}
 
-@app.post("/webhook")
+
+@app.get(
+    "/positions",
+    tags=["Trading"],
+    summary="List open positions",
+    response_model=list[PositionItem],
+)
+async def positions(
+    symbol: str | None = Query(default=None, description="Filter by symbol (e.g. EURUSD). Omit for all positions."),
+):
+    """MT5 integration is currently disabled; positions endpoint is unavailable."""
+    raise HTTPException(status_code=503, detail="MT5 service is currently disabled")
+
+
+@app.post(
+    "/webhook",
+    tags=["Trading"],
+    summary="Receive a trading signal",
+    response_model=WebhookResponse,
+    responses={
+        400: {"description": "Order execution failed"},
+        403: {"description": "Invalid API key"},
+    },
+)
 async def receive_signal(signal: TradeSignal, verified: bool = Depends(verify_request)):
     """
-    Endpoint qui reçoit l'alerte de TradingView
+    Main endpoint for incoming trading signals (designed for TradingView webhooks).
+
+    Supported actions:
+    - **buy** / **sell** — market order at current price
+    - **buy_limit** / **sell_limit** — pending limit order (requires `price`)
+    - **buy_stop** / **sell_stop** — pending stop order (requires `price`)
+    - **close_all** — close every open position on the given `symbol`
     """
-    print(f"Signal Reçu: {signal.action} sur {signal.symbol} | SL: {signal.sl}")
-    
-    # Ici, vous intégreriez la librairie de votre exchange (ccxt, ib_insync, etc.)
-    # Exemple de gestion du risque : 
-    # if position_size > max_allowed: return "Risk Limit Exceeded"
-    
-    return {"status": "success", "message": f"Ordre {signal.action} exécuté"}
+    logger.info("Signal received: %s %s %.2f lots", signal.action, signal.symbol, signal.quantity)
+    raise HTTPException(status_code=503, detail="MT5 service is currently disabled")
 
 if __name__ == "__main__":
     import os
